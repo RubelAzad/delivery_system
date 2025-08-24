@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Manage Delivery Zones</title>
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <!-- Leaflet core -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Leaflet.Draw (needed for polygon/circle draw UI) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+    <style>
+        body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif; }
+        .topbar { padding: 10px 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; background:#fafafa; border-bottom:1px solid #e5e5e5; }
+        .topbar label { font-size: 14px; color:#333; }
+        .topbar input[type="number"], .topbar input[type="text"] { padding:6px 8px; border:1px solid #d0d0d0; border-radius:8px; }
+        .topbar button { padding:8px 12px; border:1px solid #d0d0d0; background:#fff; border-radius:8px; cursor:pointer; }
+        .topbar button:hover { background:#f3f3f3; }
+        #map { height: calc(100vh - 64px); }
+        .panel {
+            position: absolute; z-index: 9999; top: 80px; right: 12px; width: 320px; max-width: calc(100vw - 24px);
+            background: #fff; border: 1px solid #e5e5e5; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.07);
+            overflow: hidden;
+        }
+        .panel h3 { margin: 0; padding: 12px; font-size: 16px; background: #f8f8f8; border-bottom: 1px solid #eee; }
+        .panel .content { padding: 12px; display: grid; gap: 10px; }
+        .panel .row { display: grid; gap: 6px; }
+        .panel input { padding:8px 10px; border:1px solid #d0d0d0; border-radius:8px; width: 100%; }
+        .panel .btn { padding:10px 12px; border:none; border-radius:8px; background:#1976d2; color:#fff; font-weight:600; cursor:pointer; }
+        .panel .btn:hover { background:#155ea8; }
+        .toast {
+            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+            background: #222; color:#fff; padding: 10px 14px; border-radius: 10px; z-index: 10000; opacity: 0.95;
+            font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+        }
+        .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#eee; font-size:12px; }
+        .ok { background:#e7f7ec; color:#1e7f3d; border:1px solid #cfead8; }
+        .err { background:#fdeaea; color:#b11f1f; border:1px solid #f5c6c6; }
+        .hint { color:#555; font-size:12px; }
+        .muted { color:#666; font-size:12px; }
+        .small { font-size:12px; }
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <label>Restaurant ID
+            <input id="restaurantId" type="number" value="1" min="1" step="1" style="width:90px">
+        </label>
+        <label>API Token (optional for PAT)
+            <input id="apiToken" type="text" placeholder="paste Sanctum PAT or leave empty if logged in">
+        </label>
+        <button id="csrfBtn" title="Fetch CSRF cookie for session auth">Get CSRF Cookie</button>
+        <span class="muted">Draw a polygon or circle to create a zone. Drop a marker to validate an order.</span>
+    </div>
+
+    <div id="map"></div>
+
+    <div class="panel">
+        <h3>Order Validation / Assignment</h3>
+        <div class="content">
+            <div class="row">
+                <div class="small">1) Click the map to drop the delivery address marker (drag to adjust).</div>
+                <div id="addrCoords" class="hint">No marker yet</div>
+            </div>
+            <div class="row">
+                <button id="validateBtn" class="btn" disabled>Validate & Assign</button>
+            </div>
+            <div class="row">
+                <div id="resultBox" class="small"></div>
+            </div>
+            <div class="row">
+                <div class="hint">Tips: If you’re logged in via the same domain and Sanctum is stateful, you can leave the token empty.</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // --- Endpoints from named routes (server-side renders the absolute URL) ---
+    const ENDPOINTS = {
+        createZone: @json(route('api.delivery-zones.store')),
+        validate:   @json(route('api.orders.validate')),
+        csrfCookie: '/sanctum/csrf-cookie'
+    };
+
+    // --- Map init ---
+    const map = L.map('map').setView([40.7128, -74.0060], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+    // Draw controls
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+    const drawControl = new L.Control.Draw({
+        draw: { polygon: true, circle: true, marker: false, polyline: false, rectangle: false },
+        edit: { featureGroup: drawnItems }
+    });
+    map.addControl(drawControl);
+
+    // Delivery address marker
+    let addrMarker = null;
+    function updateAddrReadout() {
+        const box = document.getElementById('addrCoords');
+        const btn = document.getElementById('validateBtn');
+        if (!addrMarker) {
+            box.textContent = 'No marker yet';
+            btn.disabled = true;
+        } else {
+            const { lat, lng } = addrMarker.getLatLng();
+            box.innerHTML = `<span class="badge">lat:</span> ${lat.toFixed(6)} &nbsp; <span class="badge">lng:</span> ${lng.toFixed(6)}`;
+            btn.disabled = false;
+        }
+    }
+
+    map.on('click', (e) => {
+        if (!addrMarker) {
+            addrMarker = L.marker(e.latlng, { draggable: true }).addTo(map);
+            addrMarker.on('drag', updateAddrReadout);
+            addrMarker.on('dragend', updateAddrReadout);
+        } else {
+            addrMarker.setLatLng(e.latlng);
+        }
+        updateAddrReadout();
+    });
+
+    // Toast helper
+    let toastEl=null, toastTimer=null;
+    function toast(msg, ok=true) {
+        if (toastEl) { document.body.removeChild(toastEl); toastEl=null; }
+        if (toastTimer) { clearTimeout(toastTimer); toastTimer=null; }
+
+        toastEl = document.createElement('div');
+        toastEl.className = 'toast';
+        toastEl.textContent = msg;
+        document.body.appendChild(toastEl);
+        toastTimer = setTimeout(() => {
+            if (toastEl) { document.body.removeChild(toastEl); toastEl=null; }
+        }, 3500);
+    }
+
+    // Auth header builder (PAT if provided)
+    function buildHeaders() {
+        const token = (document.getElementById('apiToken').value || '').trim();
+        const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        return headers;
+    }
+
+    // Optional: get CSRF cookie for stateful session auth
+    document.getElementById('csrfBtn').addEventListener('click', async () => {
+        try {
+            await fetch(ENDPOINTS.csrfCookie, { credentials: 'include' }); // sets XSRF-TOKEN cookie
+            toast('CSRF cookie set (stateful auth).', true);
+        } catch (e) {
+            console.error(e);
+            toast('Failed to get CSRF cookie.', false);
+        }
+    });
+
+    // Create Zone on draw
+    map.on('draw:created', async function (e) {
+        const layer = e.layer;
+        drawnItems.addLayer(layer);
+        const rid = Number(document.getElementById('restaurantId').value || 1);
+
+        let payload;
+        if (e.layerType === 'polygon') {
+            const coords = layer.getLatLngs()[0].map(p => ({ lat: p.lat, lng: p.lng }));
+            payload = { restaurant_id: rid, type: 'polygon', coordinates: coords };
+        } else if (e.layerType === 'circle') {
+            const c = layer.getLatLng();
+            const radiusKm = layer.getRadius() / 1000;
+            payload = { restaurant_id: rid, type: 'radius', center: { lat: c.lat, lng: c.lng }, radius: radiusKm };
+        } else {
+            return;
+        }
+
+        try {
+            const res = await fetch(ENDPOINTS.createZone, {
+                method: 'POST',
+                headers: buildHeaders(),
+                credentials: 'include', // allows session cookie auth if logged in
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok) {
+                toast('Delivery zone created ✔️', true);
+            } else {
+                toast(data?.message || 'Failed to create zone', false);
+            }
+        } catch (err) {
+            console.error(err);
+            toast('Network error creating zone', false);
+        }
+    });
+
+    // Validate & Assign button
+    document.getElementById('validateBtn').addEventListener('click', async () => {
+        if (!addrMarker) return;
+        const rid = Number(document.getElementById('restaurantId').value || 1);
+        const { lat, lng } = addrMarker.getLatLng();
+        const payload = { restaurant_id: rid, delivery_address: { lat, lng } };
+
+        const resultBox = document.getElementById('resultBox');
+        resultBox.innerHTML = 'Submitting...';
+
+        try {
+            const res = await fetch(ENDPOINTS.validate, {
+                method: 'POST',
+                headers: buildHeaders(),
+                credentials: 'include',
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.status === 201) {
+                resultBox.innerHTML = `<div class="ok" style="padding:8px;border-radius:8px">✅ ${data?.message || 'Order placed & assigned'}</div>`;
+                toast('Order placed & assigned ✔️', true);
+            } else {
+                resultBox.innerHTML = `<div class="err" style="padding:8px;border-radius:8px">❌ ${data?.message || 'Validation failed'}</div>`;
+                toast(data?.message || 'Validation failed', false);
+            }
+        } catch (e) {
+            console.error(e);
+            resultBox.innerHTML = `<div class="err" style="padding:8px;border-radius:8px">❌ Network error</div>`;
+            toast('Network error', false);
+        }
+    });
+
+    // Initialize UI state
+    updateAddrReadout();
+    </script>
+</body>
+</html>
